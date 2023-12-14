@@ -1,6 +1,8 @@
 from typing import Any, Optional
 
 import math
+from pathlib import Path
+
 import numpy as np
 import torch
 from torch import nn
@@ -8,6 +10,15 @@ import torch.nn.functional as F
 
 from .ggml_structs import *
 from .params import *
+from .tokenizer import Detokenizer
+
+
+ENABLE_DEBUG = False
+
+
+def debug(*args):
+    if ENABLE_DEBUG:
+        print(*args)
 
 
 class LlamaCPP(HParamsModule):
@@ -34,18 +45,14 @@ class LlamaCPP(HParamsModule):
         )
 
         # Initialize the rope.
-        if "llama.rope.scale_linear" in self.hp:
-            self.rope_scaling_type = "linear"
-            self.rope_scaling_factor = self.hp["llama.rope.scale_linear"]
+        if "llama.rope.dimension_count" in self.hp:
+            scaling_factor = None
+            if "llama.rope.scale_linear" in self.hp:
+                scaling_factor = int(self.hp["llama.rope.scale_linear"])
             self.rope_dimension_count = self.hp["llama.rope.dimension_count"]
-            self.cos_cached, self.sin_cached = create_cos_sin_cache(
+            self.rotary_embed_table = create_rotary_embed_table(
                 max_seqlen=self.max_seqlen,
-                dim=self.attention_head_dim,
-                dtype=self.hp.dtype,
-                scaling_factor=self.rope_scaling_factor,
-            )
-            print(
-                "COS_CACHE:", self.cos_cached.shape, "SIN_CACHE:", self.sin_cached.shape
+                dim=self.rope_dimension_count,
             )
         else:
             raise ValueError("Unsupported rotary embedding")
@@ -72,10 +79,25 @@ class LlamaCPP(HParamsModule):
             dtype=self.hp.dtype,
         )
 
-    def forward(self, tokens: torch.Tensor, start_index: int, return_logits: bool = False):
+    def forward(
+        self, tokens: torch.Tensor, start_index: int, return_logits: bool = False
+    ):
+        print(f"INPUT IDS({start_index}):", tokens)
         bs, sl = tokens.shape
         assert bs == self.hp.bs, "Batch size mismatch vs params"
         h = self.tok_embeddings(tokens)
+
+        # Compute attention mask.
+        attention_mask = None
+        if sl > 1:
+            # Use the smallest value like HF as opposed to -inf like original.
+            # A little bit easier for some systems.
+            attention_mask = torch.full(
+                (1, 1, sl, sl), torch.finfo(self.hp.dtype).min, dtype=self.hp.dtype
+            )
+            attention_mask = torch.triu(
+                attention_mask, diagonal=start_index + 1
+            ).type_as(h)
 
         # Transformer blocks.
         for block_idx in range(self.transformer_block_count):
@@ -83,13 +105,13 @@ class LlamaCPP(HParamsModule):
             # Attention.
             cache_k = self.cache_k[block_idx, ...]
             cache_v = self.cache_v[block_idx, ...]
-            print("*** BLOCK:", block_idx, "CACHE K/V:", cache_k.shape, cache_v.shape)
             attention_output = self.attention(
                 transformer_theta,
                 h,
                 cache_k=cache_k,
                 cache_v=cache_v,
                 start_index=start_index,
+                attention_mask=attention_mask,
             )
             h = h + attention_output
 
@@ -99,12 +121,20 @@ class LlamaCPP(HParamsModule):
                 h,
                 eps=self.attention_layer_norm_rms_epsilon,
             )
-            ff_output = F.silu(
-                self.linear(transformer_theta("ffn_gate"), ff_input)
-            ) * self.linear(transformer_theta("ffn_up"), ff_input)
-            ff_output = self.linear(transformer_theta("ffn_down"), ff_output)
-            print("FF_OUTPUT:", ff_output.shape)
-            h = h + ff_output
+            ff_gate = F.silu(
+                self.linear(
+                    transformer_theta("ffn_gate"),
+                    ff_input,
+                    stored_transposed=True,
+                )
+            )
+            ff_up = self.linear(
+                transformer_theta("ffn_up"), ff_input, stored_transposed=True
+            )
+            ff_down = self.linear(
+                transformer_theta("ffn_down"), ff_gate * ff_up, stored_transposed=True
+            )
+            h = h + ff_down
 
         # Output norm.
         h = self.rms_norm(
@@ -113,23 +143,26 @@ class LlamaCPP(HParamsModule):
             eps=self.attention_layer_norm_rms_epsilon,
         )
 
-        # Output projection.
-        hl = h[:, -1, :]
-        print("HL:", hl.shape)
-        output = self.linear(self.theta("output"), hl)
-        if return_logits:
-            return output
-        else:
-            return torch.argmax(output, dim=1)
+        # Output LM head.
+        logits = self.linear(self.theta("output"), h, stored_transposed=True)
 
-    def tok_embeddings(self, tokens):
+        # Return logits or token.
+        # Shape: bs, sl, logits
+        if return_logits:
+            return h
+        else:
+            last_step = logits[:, -1, :]
+            token = torch.argmax(last_step, dim=1)
+            return token
+
+    def tok_embeddings(self, tokens, stored_transposed=True):
         w, qw = self.p("token_embd", "weight")
         if qw is not None:
             w = qw.unpack().dequant(self.hp.dtype)
-        print("TOKENS:", tokens.shape)
-        print("EMB_WEIGHT:", w.shape)
-        # TODO: Look at what ggml is doing wrt transposition.
-        return F.embedding(tokens, w.T)
+        w_shape = w.shape
+        if stored_transposed:
+            w = w.view(w_shape[1], w_shape[0])
+        return F.embedding(tokens, w)
 
     def attention(
         self,
@@ -138,13 +171,17 @@ class LlamaCPP(HParamsModule):
         *,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
-        start_index: int
+        start_index: int,
+        attention_mask: Optional[torch.Tensor] = None,
     ):
         x = self.rms_norm(
             theta("attn_norm"), x, eps=self.attention_layer_norm_rms_epsilon
         )
-        print("ATTN_INPUT:", x.shape)
-        bs, q_len, _ = x.shape
+
+        bs, q_len, feature_dim = x.shape
+        kv_seq_len = start_index + q_len
+        assert feature_dim == self.attention_head_count * self.attention_head_dim
+
         xq = self.linear(theta("attn_q"), x)
         xk = self.linear(theta("attn_k"), x)
         xv = self.linear(theta("attn_v"), x)
@@ -153,18 +190,8 @@ class LlamaCPP(HParamsModule):
         xk = xk.view(bs, q_len, self.attention_head_count_kv, self.attention_head_dim)
         xv = xv.view(bs, q_len, self.attention_head_count_kv, self.attention_head_dim)
 
-        # Apply rotary position embedding.
-        print("XQ/K/V:", xq.shape, xk.shape, xv.shape)
-        # cos/sin: [seq_len, 1, rotary_emb_dim]
-        cos = self.cos_cached[:q_len].to(x.dtype).unsqueeze(1)
-        sin = self.sin_cached[:q_len].to(x.dtype).unsqueeze(1)
-        print("COS/SIN:", cos.shape, sin.shape)
-        q_embed = (xq * cos) + (rotate_half(xq) * sin)
-        k_embed = (xk * cos) + (rotate_half(xk) * sin)
-        print("Q_EMBED/K_EMBED:", q_embed.shape, k_embed.shape)
-        # xq, xk = self.apply_rotary_emb(xq, xk, seq_len=q_len)
-        xq = q_embed
-        xk = q_embed
+        offset_rotary_embed_table = self.rotary_embed_table[start_index:kv_seq_len, :]
+        xq, xk = self.apply_rotary_embed(xq, xk, offset_rotary_embed_table)
 
         # TODO: Some model variants do some form of kv repetition to expand the
         # count of kv heads to the count of attention heads used by the q.
@@ -174,30 +201,56 @@ class LlamaCPP(HParamsModule):
         ), "NYI: KV expansion"
 
         # Update our positions in the cache.
-        cache_k[:bs, start_index : start_index + q_len] = xk
-        cache_v[:bs, start_index : start_index + q_len] = xv
+        cache_k[:bs, start_index:kv_seq_len] = xk
+        cache_v[:bs, start_index:kv_seq_len] = xv
 
         # Derive keys/values from the entirety of the available sequence.
-        keys = cache_k[:bs, : start_index + q_len]
-        values = cache_k[:bs, : start_index + q_len]
+        keys = cache_k[:bs, :kv_seq_len]
+        values = cache_v[:bs, :kv_seq_len]
 
         # Tranpose into [bs, heads, sl, dim]
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
 
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(
+        attn_weights = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(
             self.attention_head_dim
         )
-        print("SCORES:", scores.shape)
 
-        # TODO: If masking, apply a -inf bias to masked regions.
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, heads, slen, head_dim)
+        # Apply attention mask.
+        if attention_mask is not None:
+            expected_mask_shape = (bs, 1, q_len, kv_seq_len)
+            assert (
+                attention_mask.shape == expected_mask_shape
+            ), f"Attention mask should be of size {expected_mask_shape}, but is {attention_mask.shape}"
+            attn_weights = attn_weights + attention_mask
+
+        attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(xq)
+        output = torch.matmul(attn_weights, values)  # (bs, heads, slen, head_dim)
         output = output.transpose(1, 2).reshape(bs, q_len, -1)
-        print("OUTPUT:", output.shape)
 
-        return self.linear(theta("attn_output"), output)
+        output = self.linear(theta("attn_output"), output)
+        return output
+
+    def apply_rotary_embed(
+        self,
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
+        # xq_, xk_ shape: bs, sl, _, dim
+        # freqs_cis shape: max_sl, dim
+        xq_ = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2))
+        xk_ = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2))
+        _, sl, _, dim = xq_.shape
+
+        assert freqs_cis.shape[-1] == dim
+        assert freqs_cis.shape[0] >= sl, "Sequence length longer than embedding table"
+        bounded_freqs_cis = freqs_cis[None, 0:sl, None, :]
+
+        xq_out = torch.view_as_real(xq_ * bounded_freqs_cis).flatten(3)
+        xk_out = torch.view_as_real(xk_ * bounded_freqs_cis).flatten(3)
+        return xq_out.type_as(xq), xk_out.type_as(xk)
 
     def rms_norm(self, theta: Theta, x: torch.Tensor, *, eps: float = 1e-6):
         w, qw = theta.p("weight")
@@ -205,46 +258,48 @@ class LlamaCPP(HParamsModule):
             w = qw.unpack().dequant(self.hp.dtype)
         variance = x.pow(2).mean(-1, keepdim=True)
         output = x * torch.rsqrt(variance + eps)
-        print("X:", x.shape)
-        print("W:", w.shape)
-        return output * w
+        output = output * w
+        return output
 
-    def linear(self, theta: Theta, x: torch.Tensor, *, transpose_weights=False):
+    def linear(
+        self,
+        theta: Theta,
+        x: torch.Tensor,
+        *,
+        transpose_weights=True,
+        stored_transposed=False,
+    ):
         w, qw = theta.p("weight")
         if qw is not None:
             w = qw.unpack().dequant(self.hp.dtype)
+        if stored_transposed:
+            w = w.reshape(w.shape[1], w.shape[0])
         if transpose_weights:
             w = w.T
         return torch.matmul(x, w)
 
-def create_cos_sin_cache(
-    max_seqlen: int,
-    dim: int,
-    dtype,
-    scaling_factor: Optional[float] = None,
-    base=10000,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    t = torch.arange(max_seqlen, dtype=dtype)
-    if scaling_factor is not None:
-        t = t / scaling_factor
 
-    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-    freqs = torch.outer(t, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    return emb.cos().to(dtype), emb.sin().to(dtype)
-
-
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+def create_rotary_embed_table(max_seqlen: int, dim: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(max_seqlen, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
 
 
 if __name__ == "__main__":
-    hp = HParams("/home/stella/tmp/ggml/vicuna-13b-v1.5-16k.Q8_0.gguf")
-    print("TOKENS:", len(hp.tables["tokenizer.ggml.tokens"]))
-    print("SCORES:", len(hp.tables["tokenizer.ggml.scores"]))
+    path = Path("/home/stella/tmp/hf/open_llama_3b")
+    hp = HParams(path / "ggml-model-f16.gguf")
+    # print(hp)
+    detokenizer = Detokenizer(hp)
     model = LlamaCPP(hp)
-    logits = model.forward(torch.tensor([[4, 5, 6, 7]]), 0)
-    print(logits)
-    print(logits.shape)
+    start_index = 0
+    next_tokens = [1, 1059, 31871, 1217, 322, 266, 3682, 6075, 31902, 13, 31849, 31871]
+    while True:
+        print("Step", start_index)
+        tokens = model.forward(torch.tensor([next_tokens]), start_index)
+        token = int(tokens[0])
+        print("  : token_ids =", token)
+        print("  : tokens =", detokenizer.detokenize(token))
+        start_index += len(next_tokens)
+        next_tokens = [token]

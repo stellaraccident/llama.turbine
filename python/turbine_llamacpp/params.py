@@ -38,7 +38,7 @@ class ModelTensor:
     def as_tensor(self) -> torch.Tensor:
         tn = self.type_name
         if tn in ["F16", "F32", "F64"]:
-            return torch.Tensor(self.data)
+            return torch.Tensor(self.data).reshape(self.shape)
         raise ValueError(f"Tensor type {tn} not supported")
 
     def as_q8_0(self) -> Q8_0:
@@ -79,6 +79,8 @@ class HParams:
                     self.raw_params[field.name] = field.parts[-1][0]
             else:
                 self.tables[field.name] = field.parts
+                # from IPython import embed
+                # embed()                
 
         # Extract tensors.
         for tensor in reader.tensors:

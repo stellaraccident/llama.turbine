@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional, Union
 
 from dataclasses import dataclass
 import os
@@ -12,7 +12,9 @@ from .ggml_structs import *
 
 __all__ = [
     "HParams",
+    "HParamsModule",
     "ModelTensor",
+    "Theta",
 ]
 
 
@@ -22,6 +24,10 @@ class ModelTensor:
     shape: np.memmap
     type_name: str
     data: np.memmap
+
+    @property
+    def is_quantized(self) -> bool:
+        return self.type_name.startswith("Q")
 
     def as_qtensor(self) -> QuantizedTensor:
         tn = self.type_name
@@ -43,7 +49,12 @@ class ModelTensor:
 
 
 class HParams:
-    def __init__(self, gguf_path: os.PathLike[str], bs: int = 1):
+    def __init__(
+        self,
+        gguf_path: os.PathLike[str],
+        bs: int = 1,
+        dtype: torch.dtype = torch.float32,
+    ):
         self.raw_params: dict[str, Any] = {}
         self.tensors: dict[str, ModelTensor] = {}
         self.tables: dict[str, Any] = {}
@@ -52,6 +63,8 @@ class HParams:
 
         # Additional params.
         self.bs = bs
+        self.dtype = dtype
+        self.rotary_emb_dtype = dtype
 
     def _load_gguf(self, reader: GGUFReader):
         # Extract hyper-parameters. Adapted from gguf-dump.py
@@ -76,6 +89,73 @@ class HParams:
                 data=tensor.data,
             )
 
+    def __getitem__(self, k: str):
+        try:
+            return self.raw_params[k]
+        except KeyError as e:
+            raise KeyError(
+                f"Raw hyper-parameter {k} not found. Available: {self.raw_params.keys()}"
+            ) from e
+
+    def __contains__(self, k: str):
+        return self.raw_params.__contains__(k)
+
+    def __iter__(self):
+        return self.raw_params.__iter__()
+
+    @property
+    def tensor_params(
+        self,
+    ) -> tuple[torch.nn.ParameterDict, dict[str, QuantizedTensor]]:
+        """Generates parameter dicts of tensors.
+
+        Tensor names will be parsed by splitting on '.' and placing the
+        parameter in a nested dictionary/list struct composed by
+        traversing the name parts. The result should be a hierarchical
+        view that produces the same dotted name if re-assembled.
+
+        Returns a nn.ParameterDict of the raw parameters and a regular
+        dict of QuantizedTensor for any parameters that are quantized.
+        """
+        params_dict = torch.nn.ParameterDict()
+        qparams_dict: dict[str, QuantizedTensor] = {}
+
+        def add_to_dict(
+            quantized: bool,
+            name: str,
+            value,
+        ):
+            current_p = params_dict
+            current_q = qparams_dict
+
+            parts = name.split(".")
+            for part in parts[0:-1]:
+                if part not in current_p:
+                    current_p[part] = torch.nn.ParameterDict()
+                    current_q[part] = dict()
+                current_p = current_p[part]
+                current_q = current_q[part]
+                assert isinstance(
+                    current_p, torch.nn.ParameterDict
+                ), f"Name collision in parameter dict: {name}"
+                assert isinstance(
+                    current_q, dict
+                ), f"Name collision in parameter dict: {name}"
+            if quantized:
+                current_q[parts[-1]] = value
+            else:
+                current_p[parts[-1]] = value
+
+        for hp_tensor in self.tensors.values():
+            if hp_tensor.is_quantized:
+                qt = hp_tensor.as_qtensor()
+                qt.linear = torch.nn.Parameter(qt.linear, requires_grad=False)
+                add_to_dict(False, hp_tensor.name, qt.linear)
+                add_to_dict(True, hp_tensor.name, qt)
+            else:
+                add_to_dict(False, hp_tensor.name, hp_tensor.as_tensor())
+        return params_dict, qparams_dict
+
     def __repr__(self):
         parts = ["HParams(", "  raw_params=["]
 
@@ -90,3 +170,55 @@ class HParams:
         parts.append("  ])")
 
         return "\n".join(parts)
+
+
+class Theta:
+    def __init__(self, params: torch.nn.ParameterDict, qparams: dict):
+        self.params = params
+        self.qparams = qparams
+
+    def p(
+        self, *name_path: Union[str, int]
+    ) -> tuple[torch.Tensor, Optional[QuantizedTensor]]:
+        current_p = self.params
+        current_q = self.qparams
+        try:
+            for part in name_path[0:-1]:
+                current_p = current_p[str(part)]
+                current_q = current_q[str(part)]
+            last = name_path[-1]
+            p = current_p[last]
+            q = current_q[last] if last in current_q else None
+            assert isinstance(p, torch.Tensor), f"Param {name_path} is not a tensor"
+            assert q is None or isinstance(
+                q, QuantizedTensor
+            ), f"Param {name_path} is not a tensor"
+        except KeyError:
+            raise KeyError(f"Unknown parameter {name_path}")
+        return p, q
+
+    def __call__(self, *name_path: Union[str, int]) -> "Theta":
+        current_p = self.params
+        current_q = self.qparams
+        try:
+            for part in name_path:
+                current_p = current_p[str(part)]
+                current_q = current_q[str(part)]
+        except KeyError:
+            raise KeyError(f"Sub-theta {name_path} not found")
+        return Theta(current_p, current_q)
+
+    def __repr__(self):
+        return f"Theta({self.params.keys()})"
+
+
+class HParamsModule(torch.nn.Module):
+    def __init__(self, hp: HParams):
+        super().__init__()
+        self.hp = hp
+        self.theta = Theta(*hp.tensor_params)
+
+    def p(
+        self, *name_path: Union[str, int]
+    ) -> tuple[torch.Tensor, Optional[QuantizedTensor]]:
+        return self.theta.p(*name_path)

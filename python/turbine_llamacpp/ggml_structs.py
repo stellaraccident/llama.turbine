@@ -73,12 +73,12 @@ class Q8_0(QuantizedTensor[Q8_0Struct]):
         self.shape = shape
 
     def unpack(self) -> Q8_0Struct:
-        # Blocks are 17 f16s, so start there.
-        linear_blocks = self.linear.view(torch.float16).reshape(-1, 17)
+        # Blocks are 17 i16s, so start there.
+        linear_blocks = self.linear.view(torch.int16).reshape(-1, 17)
         # Reblock to the result shape excluding the final dimension, which
         # is expanded.
         block_shape = self.shape[0:-1] + [-1, 17]
         blocks = linear_blocks.reshape(block_shape)
-        d = blocks[..., 0:1]
-        qs = blocks[..., 1:].view(torch.uint8)
+        d = blocks[..., 0:1].view(torch.float16)
+        qs = blocks[..., 1:].view(torch.int8)
         return Q8_0Struct(self.shape, blocks, d, qs)

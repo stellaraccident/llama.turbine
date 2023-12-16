@@ -82,11 +82,10 @@ class LlamaCPP(HParamsModule):
     def forward(
         self, tokens: torch.Tensor, start_index: int, return_logits: bool = False
     ):
-        print(f"INPUT IDS({start_index}):", tokens)
         bs, sl = tokens.shape
         assert bs == self.hp.bs, "Batch size mismatch vs params"
         h = self.tok_embeddings(tokens)
-
+        
         # Compute attention mask.
         attention_mask = None
         if sl > 1:
@@ -288,8 +287,9 @@ def create_rotary_embed_table(max_seqlen: int, dim: int, theta: float = 10000.0)
 
 
 if __name__ == "__main__":
+    torch.no_grad().__enter__()
     path = Path("/home/stella/tmp/hf/open_llama_3b")
-    hp = HParams(path / "ggml-model-f16.gguf")
+    hp = HParams(path / "ggml-model-q8_0.gguf")
     # print(hp)
     detokenizer = Detokenizer(hp)
     model = LlamaCPP(hp)

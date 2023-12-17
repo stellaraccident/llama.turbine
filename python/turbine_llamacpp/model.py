@@ -80,12 +80,18 @@ class LlamaCPP(HParamsModule):
         )
 
     def forward(
-        self, tokens: torch.Tensor, start_index: int, return_logits: bool = False
+        self,
+        tokens: torch.Tensor,
+        start_index: int,
+        *,
+        return_logits: bool = False,
+        local_cache_k: Optional[torch.Tensor] = None,
+        local_cache_v: Optional[torch.Tensor] = None,
     ):
         bs, sl = tokens.shape
         assert bs == self.hp.bs, "Batch size mismatch vs params"
         h = self.tok_embeddings(tokens)
-        
+
         # Compute attention mask.
         attention_mask = None
         if sl > 1:
@@ -98,17 +104,23 @@ class LlamaCPP(HParamsModule):
                 attention_mask, diagonal=start_index + 1
             ).type_as(h)
 
+        # Allow either the global cache or a local set passed in parameters.
+        if local_cache_k is None:
+            local_cache_k = self.cache_k
+        if local_cache_v is None:
+            local_cache_v = self.cache_v
+
         # Transformer blocks.
         for block_idx in range(self.transformer_block_count):
             transformer_theta = self.theta("blk", block_idx)
             # Attention.
-            cache_k = self.cache_k[block_idx, ...]
-            cache_v = self.cache_v[block_idx, ...]
+            block_cache_k = local_cache_k[block_idx, ...]
+            block_cache_v = local_cache_v[block_idx, ...]
             attention_output = self.attention(
                 transformer_theta,
                 h,
-                cache_k=cache_k,
-                cache_v=cache_v,
+                cache_k=block_cache_k,
+                cache_v=block_cache_v,
                 start_index=start_index,
                 attention_mask=attention_mask,
             )
@@ -151,8 +163,8 @@ class LlamaCPP(HParamsModule):
             return h
         else:
             last_step = logits[:, -1, :]
-            token = torch.argmax(last_step, dim=1)
-            return token
+            token = torch.argmax(last_step, keepdim=True, dim=1)
+            return token.to(tokens.dtype)
 
     def tok_embeddings(self, tokens, stored_transposed=True):
         w, qw = self.p("token_embd", "weight")

@@ -4,9 +4,18 @@ import torch
 
 from shark_turbine.aot import *
 
-from .params import *
-from .model import LlamaCPP
+from turbine_llamacpp.params import *
+from turbine_llamacpp.model import LlamaCPP
 
+
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--gguf_path",
+    type=str,
+    default="ggml-model-q8_0.gguf",
+    help="path to gguf",
+)
 
 def create_direct_predict_internal_kv_module(model: LlamaCPP) -> CompiledModule:
     """This compilation performs direct, non-sampled prediction.
@@ -109,11 +118,12 @@ def create_direct_predict_internal_kv_module(model: LlamaCPP) -> CompiledModule:
 
 
 def main():
-    path = Path("/home/stella/tmp/hf/open_llama_3b")
-    hp = HParams(path / "ggml-model-q8_0.gguf")
+    args = parser.parse_args()
+    hp = HParams(args.gguf_path)
     model = LlamaCPP(hp)
     cm = create_direct_predict_internal_kv_module(model)
-    print(CompiledModule.get_mlir_module(cm))
+    with open(f"output.mlir", "w+") as f:
+        f.write(str(CompiledModule.get_mlir_module(cm)))
 
 
 if __name__ == "__main__":

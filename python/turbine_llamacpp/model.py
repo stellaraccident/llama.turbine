@@ -8,13 +8,21 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .ggml_structs import *
-from .params import *
-from .tokenizer import Detokenizer
+from turbine_llamacpp.ggml_structs import *
+from turbine_llamacpp.params import *
+from turbine_llamacpp.tokenizer import Detokenizer
 
 
 ENABLE_DEBUG = False
 
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--gguf_path",
+    type=str,
+    default="ggml-model-q8_0.gguf",
+    help="path to gguf",
+)
 
 def debug(*args):
     if ENABLE_DEBUG:
@@ -299,9 +307,9 @@ def create_rotary_embed_table(max_seqlen: int, dim: int, theta: float = 10000.0)
 
 
 if __name__ == "__main__":
+    args = parser.parse_args()
     torch.no_grad().__enter__()
-    path = Path("/home/stella/tmp/hf/open_llama_3b")
-    hp = HParams(path / "ggml-model-q8_0.gguf")
+    hp = HParams(args.gguf_path)
     # print(hp)
     detokenizer = Detokenizer(hp)
     model = LlamaCPP(hp)

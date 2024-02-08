@@ -22,3 +22,9 @@ dist/
 wheelhouse
 *.egg-info
 *.whl
+
+#Llama.cpp artifacts
+llama.cpp/
+*.gguf
+downloaded_*/
+output.mlir

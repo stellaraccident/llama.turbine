@@ -31,6 +31,8 @@ class ModelTensor:
 
     def as_qtensor(self) -> QuantizedTensor:
         tn = self.type_name
+        if tn == "Q4_0":
+            return self.as_q4_0()
         if tn == "Q8_0":
             return self.as_q8_0()
         raise ValueError(f"Quantized type {tn} not supported")
@@ -40,6 +42,10 @@ class ModelTensor:
         if tn in ["F16", "F32", "F64"]:
             return torch.Tensor(self.data).reshape(self.shape)
         raise ValueError(f"Tensor type {tn} not supported")
+
+    def as_q4_0(self) -> Q4_0:
+        # import pdb; pdb.set_trace()
+        return Q4_0(torch.tensor(self.data), self.shape)
 
     def as_q8_0(self) -> Q8_0:
         return Q8_0(torch.tensor(self.data), self.shape)

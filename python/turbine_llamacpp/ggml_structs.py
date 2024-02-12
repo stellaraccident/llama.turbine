@@ -103,16 +103,14 @@ class Q4_0Struct(UnpackedStruct):
             d = d.to(dtype)
         else:
             dtype = d.dtype
-        v1 = (qs & 0xF) - 8
-        v2 = (qs >> 4) - 8
+        v1 = (qs & 0xF)
+        v2 = (qs >> 4)
         # Set up shape for combined unpacked dequants.
         target_shape = list(v1.shape)
         target_shape[-1] = v1.shape[-1] + v2.shape[-1]
-        # Combining unpacked quants with alternating patterns.
-        v3 = torch.zeros(target_shape)
-        v3[:, :, ::2] = v1
-        v3[:, :, 1::2] = v2
-        scaled = d * v3.to(dtype)
+        # Combining unpacked quants.
+        v3 = torch.cat([v1,v2],dim=-1)
+        scaled = d * (v3.to(dtype) - 8.0)
         return scaled
 
     def __repr__(self):
@@ -130,6 +128,7 @@ class Q4_0(QuantizedTensor[Q4_0Struct]):
     ```
     Dequant:
     https://github.com/ggerganov/llama.cpp/blob/f026f8120f97090d34a52b3dc023c82e0ede3f7d/ggml-opencl.cpp#L119-L130
+    https://github.com/ggerganov/llama.cpp/blob/f026f8120f97090d34a52b3dc023c82e0ede3f7d/ggml-opencl.cpp#L760-L772
     """
 
     def __init__(self, linear: torch.Tensor, shape: list[int]):
@@ -147,5 +146,5 @@ class Q4_0(QuantizedTensor[Q4_0Struct]):
         block_shape = self.shape[0:-1] + [-1, 9]
         blocks = linear_blocks.reshape(block_shape)
         d = blocks[..., 0:1].view(torch.float16)
-        qs = blocks[..., 1:].view(torch.int8)
+        qs = blocks[..., 1:].view(torch.uint8)
         return Q4_0Struct(self.shape, blocks, d, qs)

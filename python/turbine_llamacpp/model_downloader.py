@@ -15,12 +15,18 @@ parser.add_argument(
     default="openlm-research/open_llama_3b",
 )
 
+
 def donwload_hf_model(hf_auth_token, hf_model_name):
     auth_token = hf_auth_token if len(hf_auth_token) != 0 else None
     model_name = hf_model_name.split("/")[-1]
-    snapshot_download(repo_id=hf_model_name, local_dir="downloaded_" + model_name,
-                    local_dir_use_symlinks=False, revision="main",
-                    token=auth_token)
+    snapshot_download(
+        repo_id=hf_model_name,
+        local_dir="downloaded_" + model_name,
+        local_dir_use_symlinks=False,
+        revision="main",
+        token=auth_token,
+    )
+
 
 if __name__ == "__main__":
     args = parser.parse_args()

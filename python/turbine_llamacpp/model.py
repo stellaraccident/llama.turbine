@@ -16,6 +16,7 @@ from turbine_llamacpp.tokenizer import Detokenizer
 ENABLE_DEBUG = False
 
 import argparse
+
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "--gguf_path",
@@ -23,6 +24,7 @@ parser.add_argument(
     default="ggml-model-q8_0.gguf",
     help="path to gguf",
 )
+
 
 def debug(*args):
     if ENABLE_DEBUG:
@@ -66,26 +68,18 @@ class LlamaCPP(HParamsModule):
             raise ValueError("Unsupported rotary embedding")
 
         # Initialize the KV cache.
-        self.cache_k = torch.empty(
-            (
-                self.transformer_block_count,
-                self.hp.bs,
-                self.max_seqlen,
-                self.attention_head_count,
-                self.attention_head_dim,
-            ),
-            dtype=self.hp.dtype,
-        )
-        self.cache_v = torch.empty(
-            (
-                self.transformer_block_count,
-                self.hp.bs,
-                self.max_seqlen,
-                self.attention_head_count,
-                self.attention_head_dim,
-            ),
-            dtype=self.hp.dtype,
-        )
+        self.kv_cache = [
+            torch.empty(
+                (
+                    self.hp.bs,
+                    self.max_seqlen,
+                    self.attention_head_count,
+                    self.attention_head_dim,
+                ),
+                dtype=self.hp.dtype,
+            )
+            for i in range(self.transformer_block_count * 2)
+        ]
 
     def forward(
         self,
@@ -93,8 +87,7 @@ class LlamaCPP(HParamsModule):
         start_index: int,
         *,
         return_logits: bool = False,
-        local_cache_k: Optional[torch.Tensor] = None,
-        local_cache_v: Optional[torch.Tensor] = None,
+        local_kv_cache: list[torch.Tensor] = None,
     ):
         bs, sl = tokens.shape
         assert bs == self.hp.bs, "Batch size mismatch vs params"
@@ -113,17 +106,15 @@ class LlamaCPP(HParamsModule):
             ).type_as(h)
 
         # Allow either the global cache or a local set passed in parameters.
-        if local_cache_k is None:
-            local_cache_k = self.cache_k
-        if local_cache_v is None:
-            local_cache_v = self.cache_v
+        if local_kv_cache is None:
+            local_kv_cache = self.kv_cache
 
         # Transformer blocks.
         for block_idx in range(self.transformer_block_count):
             transformer_theta = self.theta("blk", block_idx)
             # Attention.
-            block_cache_k = local_cache_k[block_idx, ...]
-            block_cache_v = local_cache_v[block_idx, ...]
+            block_cache_k = local_kv_cache[block_idx]
+            block_cache_v = local_kv_cache[self.transformer_block_count + block_idx]
             attention_output = self.attention(
                 transformer_theta,
                 h,
@@ -310,7 +301,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     torch.no_grad().__enter__()
     hp = HParams(args.gguf_path)
-    # print(hp)
     detokenizer = Detokenizer(hp)
     model = LlamaCPP(hp)
     start_index = 0

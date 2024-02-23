@@ -33,6 +33,8 @@ class ModelTensor:
         tn = self.type_name
         if tn == "Q4_0":
             return self.as_q4_0()
+        if tn == "Q4_1":
+            return self.as_q4_1()
         if tn == "Q8_0":
             return self.as_q8_0()
         raise ValueError(f"Quantized type {tn} not supported")
@@ -44,8 +46,10 @@ class ModelTensor:
         raise ValueError(f"Tensor type {tn} not supported")
 
     def as_q4_0(self) -> Q4_0:
-        # import pdb; pdb.set_trace()
         return Q4_0(torch.tensor(self.data), self.shape)
+
+    def as_q4_1(self) -> Q4_1:
+        return Q4_1(torch.tensor(self.data), self.shape)
 
     def as_q8_0(self) -> Q8_0:
         return Q8_0(torch.tensor(self.data), self.shape)
@@ -72,6 +76,10 @@ class HParams:
         self.dtype = dtype
         self.rotary_emb_dtype = dtype
 
+        # Quantized tensor replacement
+        self.replaced_quantized_tensors = []
+        self.supported_types = ["Q4_0", "Q4_1", "Q8_0"]
+
     def _load_gguf(self, reader: GGUFReader):
         # Extract hyper-parameters. Adapted from gguf-dump.py
         for field in reader.fields.values():
@@ -86,7 +94,7 @@ class HParams:
             else:
                 self.tables[field.name] = field.parts
                 # from IPython import embed
-                # embed()                
+                # embed()
 
         # Extract tensors.
         for tensor in reader.tensors:
@@ -110,6 +118,35 @@ class HParams:
 
     def __iter__(self):
         return self.raw_params.__iter__()
+
+    def replace_quantized_tensors(self, replaceable_types: Optional[list[str]] = None):
+        if not replaceable_types:
+            replaceable_types = self.supported_types
+        else:
+            for type in replaceable_types:
+                if type not in self.supported_types:
+                    raise ValueError(f"Replacement of type {type} not supported")
+        if self.dtype == torch.float32:
+            replacement_type_name = "F32"
+        elif self.dtype == torch.float16:
+            replacement_type_name = "F16"
+        else:
+            raise ValueError(f"Replacement into tensors of {self.dtype} not supported")
+        for tensor_name, model_tensor in self.tensors.items():
+            if model_tensor.type_name in replaceable_types:
+                self.replaced_quantized_tensors.append(
+                    (tensor_name, model_tensor.type_name)
+                )
+                replacement_data = torch.zeros(
+                    size=model_tensor.shape, dtype=self.dtype
+                )
+                new_model_tensor = ModelTensor(
+                    name=model_tensor.name,
+                    shape=model_tensor.shape,
+                    type_name=replacement_type_name,
+                    data=replacement_data,
+                )
+                self.tensors[tensor_name] = new_model_tensor
 
     @property
     def tensor_params(
@@ -163,6 +200,48 @@ class HParams:
             else:
                 add_to_dict(False, hp_tensor.name, hp_tensor.as_tensor())
         return params_dict, qparams_dict
+
+    def repack_tensor_params(
+        self,
+        dequantize_types: list[str] = [],
+        dequantize_params: list[str] = [],
+        dtype: Optional[torch.dtype] = None,
+        dequantize_all: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        if dtype is None:
+            dtype = self.dtype
+        reformatted_tensors = {}
+        for tensor_name, tensor in self.tensors.items():
+            if not tensor.is_quantized or tensor.type_name not in self.supported_types:
+                reformatted_tensors[tensor_name] = np.ascontiguousarray(
+                    tensor.as_tensor().detach().numpy()
+                )
+                continue
+            if (
+                dequantize_all
+                or tensor.type_name in dequantize_types
+                or tensor_name in dequantize_params
+            ):
+                reformatted_tensor = tensor.as_qtensor().unpack().dequant(dtype)
+                reformatted_tensors[tensor_name] = np.ascontiguousarray(
+                    reformatted_tensor.detach().numpy()
+                )
+            else:
+                reformatted_tensor, scales, zps = (
+                    tensor.as_qtensor().unpack().repack_for_turbine(dtype)
+                )
+                reformatted_tensors[tensor_name] = np.ascontiguousarray(
+                    reformatted_tensor.detach().numpy()
+                )
+                if scales is not None:
+                    reformatted_tensors[f"{tensor_name}_scale"] = np.ascontiguousarray(
+                        scales.detach().numpy()
+                    )
+                if zps is not None:
+                    reformatted_tensors[f"{tensor_name}_zp"] = np.ascontiguousarray(
+                        zps.detach().numpy()
+                    )
+        return reformatted_tensors
 
     def __repr__(self):
         parts = ["HParams(", "  raw_params=["]
